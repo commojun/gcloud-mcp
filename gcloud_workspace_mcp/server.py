@@ -11,7 +11,8 @@ import asyncio
 import json
 import os
 import re
-from typing import Optional
+from enum import Enum
+from typing import Any, List, Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -72,6 +73,39 @@ def extract_spreadsheet_id(url_or_id: str) -> str:
     """Extract spreadsheet ID from a Sheets URL, or return the input unchanged."""
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url_or_id)
     return m.group(1) if m else url_or_id
+
+
+def col_letter_to_index(letters: str) -> int:
+    """Convert column letter(s) to 0-based index. 'A'→0, 'Z'→25, 'AA'→26."""
+    result = 0
+    for ch in letters.upper():
+        result = result * 26 + (ord(ch) - ord("A") + 1)
+    return result - 1
+
+
+def col_index_to_letter(index: int) -> str:
+    """Convert 0-based column index to letter(s). 0→'A', 25→'Z', 26→'AA'."""
+    letters = ""
+    n = index + 1
+    while n > 0:
+        n, remainder = divmod(n - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
+
+
+def parse_range_start(range_str: str) -> tuple[int, int]:
+    """Extract (start_row_1indexed, start_col_0indexed) from a range like 'Sheet1!B3:D10' or 'A1'."""
+    # Remove sheet name prefix if present
+    cell_part = range_str.split("!")[-1]
+    # Take the start cell (before ':')
+    start_cell = cell_part.split(":")[0]
+    # Split letters and digits
+    m = re.match(r"([A-Za-z]+)(\d+)", start_cell)
+    if not m:
+        return 1, 0
+    col_idx = col_letter_to_index(m.group(1))
+    row_num = int(m.group(2))
+    return row_num, col_idx
 
 
 def extract_drive_file_id(url_or_id: str) -> str:
@@ -142,6 +176,56 @@ async def api_get(
             return None, "Error: Request timed out. Please try again."
 
 
+async def api_write(
+    url: str,
+    token: str,
+    method: str,
+    params: Optional[dict] = None,
+    body: Optional[dict] = None,
+) -> tuple[Optional[httpx.Response], Optional[str]]:
+    """Authenticated PUT/POST for write operations. Returns (response, None) or (None, error_message)."""
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.request(
+                method,
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                params=params or {},
+                json=body,
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            return resp, None
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            try:
+                api_msg = e.response.json().get("error", {}).get("message", "")
+            except Exception:
+                api_msg = ""
+            detail = api_msg or str(e)
+
+            if status == 401:
+                return None, (
+                    f"Error 401 Unauthorized: {detail}\n"
+                    "Re-authenticate with: gcloud auth login --enable-gdrive-access"
+                )
+            elif status == 403:
+                return None, (
+                    f"Error 403 Forbidden: {detail}\n"
+                    "Check that the spreadsheet is shared with edit permission."
+                )
+            elif status == 400:
+                return None, (
+                    f"Error 400 Bad Request: {detail}\n"
+                    "Check that the range and values dimensions match, "
+                    "and that the range notation is correct (e.g. 'A1:C3')."
+                )
+            else:
+                return None, f"Error {status}: {detail}"
+        except httpx.TimeoutException:
+            return None, "Error: Request timed out. Please try again."
+
+
 # ---------------------------------------------------------------------------
 # Input models
 # ---------------------------------------------------------------------------
@@ -170,6 +254,17 @@ class ReadSheetInput(BaseModel):
         description=(
             "A1 notation range within the sheet (e.g. 'A1:D100', 'A:C'). "
             "If omitted, all data in the sheet is returned."
+        ),
+    )
+    show_formulas: bool = Field(
+        default=False,
+        description=(
+            "If True, cells containing formulas return the formula string (e.g. '=SUM(A1:A10)') "
+            "instead of the calculated value. Use this when you need to understand or replicate "
+            "existing formulas before editing. "
+            "Limitation: ARRAYFORMULA spill cells cannot be distinguished from plain value cells — "
+            "they return the calculated value regardless. Always check the formula in the first "
+            "cell of a range before writing to spill cells."
         ),
     )
 
@@ -223,6 +318,106 @@ class SearchDriveInput(BaseModel):
     )
 
 
+class ValueInputOption(str, Enum):
+    USER_ENTERED = "USER_ENTERED"
+    RAW = "RAW"
+
+
+class UpdateSheetInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    url_or_id: str = Field(
+        ...,
+        description="Spreadsheet URL or ID",
+        min_length=1,
+    )
+    range_a1: str = Field(
+        ...,
+        description=(
+            "A1 notation of the range to write (e.g. 'B3', 'A1:C3'). "
+            "Include sheet name prefix if needed (e.g. 'Sheet1!A1:C3'). "
+            "The values array dimensions must match this range."
+        ),
+        min_length=1,
+    )
+    values: List[List[Any]] = Field(
+        ...,
+        description=(
+            "2D array of values to write. Outer list = rows, inner list = cells left to right. "
+            "Example: [['Alice', 30, 'Tokyo'], ['Bob', 25, 'Osaka']] writes 2 rows × 3 columns."
+        ),
+    )
+    sheet_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Sheet tab name. Prepended to range_a1 if range_a1 does not already contain '!'. "
+            "If omitted and range_a1 has no sheet prefix, the API uses the first sheet."
+        ),
+    )
+    value_input_option: ValueInputOption = Field(
+        default=ValueInputOption.USER_ENTERED,
+        description=(
+            "USER_ENTERED (default): values are interpreted as if typed by a user — "
+            "formulas starting with '=' are evaluated, dates are parsed. "
+            "RAW: values are stored exactly as provided, no interpretation."
+        ),
+    )
+
+
+class AppendRowsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    url_or_id: str = Field(
+        ...,
+        description="Spreadsheet URL or ID",
+        min_length=1,
+    )
+    values: List[List[Any]] = Field(
+        ...,
+        description=(
+            "2D array of rows to append after the last row that has data. "
+            "Each inner list is one row. "
+            "Example: [['Alice', 30, 'Tokyo']] appends one row."
+        ),
+    )
+    sheet_name: Optional[str] = Field(
+        default=None,
+        description="Sheet tab name to append to. If omitted, appends to the first sheet.",
+    )
+    value_input_option: ValueInputOption = Field(
+        default=ValueInputOption.USER_ENTERED,
+        description=(
+            "USER_ENTERED (default): formulas and dates are interpreted. "
+            "RAW: values stored exactly as provided."
+        ),
+    )
+
+
+class ClearRangeInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    url_or_id: str = Field(
+        ...,
+        description="Spreadsheet URL or ID",
+        min_length=1,
+    )
+    range_a1: str = Field(
+        ...,
+        description=(
+            "A1 notation of the range to clear (e.g. 'B3:D10', 'A5'). "
+            "Include sheet name prefix if needed (e.g. 'Sheet1!A1:Z100'). "
+            "Clearing removes values but preserves formatting."
+        ),
+        min_length=1,
+    )
+    sheet_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Sheet tab name. Prepended to range_a1 if range_a1 does not already contain '!'."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -238,10 +433,11 @@ class SearchDriveInput(BaseModel):
     },
 )
 async def read_sheet(params: ReadSheetInput) -> str:
-    """Read cell data from a Google Spreadsheet and return it as tab-separated rows.
+    """Read cell data from a Google Spreadsheet with exact cell address information.
 
-    Fetches row data from the specified sheet and range using the Sheets API v4.
-    Call list_sheets first if you are unsure of the tab name.
+    Returns a JSON object where every cell is mapped to its A1-notation address
+    (e.g. "B3"). Empty cells are included explicitly so callers can identify
+    blank cells by position. This is essential for pinpoint cell editing.
 
     Args:
         params (ReadSheetInput):
@@ -250,15 +446,29 @@ async def read_sheet(params: ReadSheetInput) -> str:
             - range_a1 (Optional[str]): A1 notation range (default: all data)
 
     Returns:
-        str: Tab-separated rows (first row is typically the header), or an error message.
+        str: JSON object with the following schema:
 
-        Success example:
-            Name\\tAge\\tCity
-            Alice\\t30\\tTokyo
-            Bob\\t25\\tOsaka
+        {
+            "range": str,          # Actual range returned (e.g. "Sheet1!A1:D5")
+            "sheet": str,          # Sheet tab name
+            "row_count": int,      # Number of data rows
+            "col_count": int,      # Number of columns (max width)
+            "rows": [
+                {
+                    "row": int,            # 1-based row number in the spreadsheet
+                    "cells": {
+                        "A": str,          # Cell value (empty string if blank)
+                        "B": str,
+                        ...
+                    }
+                }
+            ]
+        }
 
-        Error example:
-            "Error 403 Forbidden: ..."
+        To edit a specific cell, use the "row" number and column letter
+        to construct the A1 address (e.g. row=3, col="B" → "B3").
+
+        Error example: "Error 403 Forbidden: ..."
     """
     token, err = await get_access_token()
     if err:
@@ -288,18 +498,53 @@ async def read_sheet(params: ReadSheetInput) -> str:
         first_title = sheets[0]["properties"]["title"]
         range_str = f"'{first_title}'"
 
+    render_option = "FORMULA" if params.show_formulas else "UNFORMATTED_VALUE"
     resp, err = await api_get(
         f"{SHEETS_API}/{spreadsheet_id}/values/{range_str}",
         token,
+        params={"valueRenderOption": render_option},
     )
     if err:
         return err
 
-    values = resp.json().get("values", [])
+    body = resp.json()
+    values = body.get("values", [])
     if not values:
         return f"No data found in range {range_str}."
 
-    return "\n".join("\t".join(str(cell) for cell in row) for row in values)
+    actual_range = body.get("range", range_str)
+    # Extract sheet name from "SheetName!A1:D5" format
+    sheet_label = actual_range.split("!")[0].strip("'") if "!" in actual_range else ""
+
+    start_row, start_col_idx = parse_range_start(actual_range)
+    max_cols = max(len(row) for row in values)
+
+    rows = []
+    for i, row in enumerate(values):
+        # Pad shorter rows with empty strings so every column is present
+        padded = row + [""] * (max_cols - len(row))
+        cells = {
+            col_index_to_letter(start_col_idx + j): str(v)
+            for j, v in enumerate(padded)
+        }
+        rows.append({"row": start_row + i, "cells": cells})
+
+    result: dict = {
+        "range": actual_range,
+        "sheet": sheet_label,
+        "row_count": len(rows),
+        "col_count": max_cols,
+        "show_formulas": params.show_formulas,
+        "rows": rows,
+    }
+    if params.show_formulas:
+        result["formula_note"] = (
+            "Cells with formulas show the formula string (e.g. '=SUM(...)'). "
+            "Cells without formulas show the calculated value. "
+            "ARRAYFORMULA spill cells (row 2+) are indistinguishable from plain values."
+        )
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @mcp.tool(
@@ -542,6 +787,231 @@ async def search_drive(params: SearchDriveInput) -> str:
 
     return json.dumps(
         {"query": params.query, "count": len(files), "files": files},
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Write tools
+# ---------------------------------------------------------------------------
+
+def _build_write_range(range_a1: str, sheet_name: Optional[str]) -> str:
+    """Prepend sheet name to range if not already embedded."""
+    if "!" in range_a1:
+        return range_a1
+    if sheet_name:
+        return f"'{sheet_name}'!{range_a1}"
+    return range_a1
+
+
+@mcp.tool(
+    name="update_sheet",
+    annotations={
+        "title": "Write values to a Google Sheet range",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def update_sheet(params: UpdateSheetInput) -> str:
+    """Overwrite a range in a Google Spreadsheet with the given values.
+
+    Writes a 2D array of values into the specified A1 range. Existing content
+    in the range is replaced. Use read_sheet first to verify the target range
+    before writing, especially when the sheet contains formulas.
+
+    Args:
+        params (UpdateSheetInput):
+            - url_or_id (str): Spreadsheet URL or ID
+            - range_a1 (str): A1 notation range to write (e.g. 'B3', 'A1:C3')
+            - values (List[List[Any]]): 2D array — rows × cells
+            - sheet_name (Optional[str]): Tab name (prepended to range if needed)
+            - value_input_option (ValueInputOption): USER_ENTERED or RAW (default: USER_ENTERED)
+
+    Returns:
+        str: JSON with update summary, or an error message.
+
+        Success schema:
+        {
+            "updated_range": str,   # Actual range that was updated
+            "updated_rows": int,
+            "updated_columns": int,
+            "updated_cells": int
+        }
+
+        Error example: "Error 400 Bad Request: ..."
+    """
+    token, err = await get_access_token()
+    if err:
+        return err
+
+    spreadsheet_id = extract_spreadsheet_id(params.url_or_id)
+    range_str = _build_write_range(params.range_a1, params.sheet_name)
+
+    resp, err = await api_write(
+        f"{SHEETS_API}/{spreadsheet_id}/values/{range_str}",
+        token,
+        method="PUT",
+        params={"valueInputOption": params.value_input_option.value},
+        body={"range": range_str, "majorDimension": "ROWS", "values": params.values},
+    )
+    if err:
+        return err
+
+    data = resp.json()
+    return json.dumps(
+        {
+            "updated_range": data.get("updatedRange"),
+            "updated_rows": data.get("updatedRows"),
+            "updated_columns": data.get("updatedColumns"),
+            "updated_cells": data.get("updatedCells"),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool(
+    name="append_rows",
+    annotations={
+        "title": "Append rows to a Google Sheet",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def append_rows(params: AppendRowsInput) -> str:
+    """Append one or more rows after the last row that contains data.
+
+    Rows are inserted immediately after the last non-empty row in the sheet,
+    regardless of which range is specified internally. Existing data is never
+    overwritten. Each call appends a new set of rows.
+
+    Args:
+        params (AppendRowsInput):
+            - url_or_id (str): Spreadsheet URL or ID
+            - values (List[List[Any]]): 2D array of rows to append
+            - sheet_name (Optional[str]): Tab name (default: first sheet)
+            - value_input_option (ValueInputOption): USER_ENTERED or RAW (default: USER_ENTERED)
+
+    Returns:
+        str: JSON with append summary, or an error message.
+
+        Success schema:
+        {
+            "updated_range": str,   # Range where rows were appended
+            "updated_rows": int,
+            "updated_columns": int,
+            "updated_cells": int
+        }
+
+        Error example: "Error 403 Forbidden: ..."
+    """
+    token, err = await get_access_token()
+    if err:
+        return err
+
+    spreadsheet_id = extract_spreadsheet_id(params.url_or_id)
+
+    # Resolve sheet name for the append anchor range
+    if params.sheet_name:
+        anchor = f"'{params.sheet_name}'"
+    else:
+        meta_resp, err = await api_get(
+            f"{SHEETS_API}/{spreadsheet_id}",
+            token,
+            params={"fields": "sheets.properties.title"},
+        )
+        if err:
+            return err
+        sheets = meta_resp.json().get("sheets", [])
+        if not sheets:
+            return "Error: No sheets found in this spreadsheet."
+        anchor = f"'{sheets[0]['properties']['title']}'"
+
+    resp, err = await api_write(
+        f"{SHEETS_API}/{spreadsheet_id}/values/{anchor}:append",
+        token,
+        method="POST",
+        params={
+            "valueInputOption": params.value_input_option.value,
+            "insertDataOption": "INSERT_ROWS",
+        },
+        body={"majorDimension": "ROWS", "values": params.values},
+    )
+    if err:
+        return err
+
+    updates = resp.json().get("updates", {})
+    return json.dumps(
+        {
+            "updated_range": updates.get("updatedRange"),
+            "updated_rows": updates.get("updatedRows"),
+            "updated_columns": updates.get("updatedColumns"),
+            "updated_cells": updates.get("updatedCells"),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool(
+    name="clear_range",
+    annotations={
+        "title": "Clear a range in a Google Sheet",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def clear_range(params: ClearRangeInput) -> str:
+    """Clear all values in the specified range of a Google Spreadsheet.
+
+    Removes cell values but preserves formatting (colors, borders, etc.).
+    This operation is irreversible — use with caution.
+
+    Args:
+        params (ClearRangeInput):
+            - url_or_id (str): Spreadsheet URL or ID
+            - range_a1 (str): A1 notation of the range to clear (e.g. 'B3:D10')
+            - sheet_name (Optional[str]): Tab name (prepended to range if needed)
+
+    Returns:
+        str: JSON with cleared range info, or an error message.
+
+        Success schema:
+        {
+            "cleared_range": str,
+            "spreadsheet_id": str
+        }
+
+        Error example: "Error 403 Forbidden: ..."
+    """
+    token, err = await get_access_token()
+    if err:
+        return err
+
+    spreadsheet_id = extract_spreadsheet_id(params.url_or_id)
+    range_str = _build_write_range(params.range_a1, params.sheet_name)
+
+    resp, err = await api_write(
+        f"{SHEETS_API}/{spreadsheet_id}/values/{range_str}:clear",
+        token,
+        method="POST",
+    )
+    if err:
+        return err
+
+    data = resp.json()
+    return json.dumps(
+        {
+            "cleared_range": data.get("clearedRange"),
+            "spreadsheet_id": data.get("spreadsheetId"),
+        },
         ensure_ascii=False,
         indent=2,
     )
