@@ -8,7 +8,7 @@ gcloud CLI の OAuth2 認証情報を使って Google Sheets / Drive API を呼�
 
 | ツール名 | 説明 |
 |---------|------|
-| `read_sheet` | Sheets の URL/ID を受け取り、セルアドレス付きの JSON 形式でデータを返す。`show_formulas=true` で数式文字列を取得可能 |
+| `read_sheet` | Sheets の URL/ID を受け取り、セルアドレス付きの JSON 形式でデータを返す。空セル・空行は結果に含まれない。`show_formulas=true` で数式文字列を取得可能 |
 | `list_sheets` | スプレッドシートのシート名一覧とプロパティ（行数・列数・非表示フラグ）を返す |
 | `read_drive_file` | Drive ファイルの URL/ID を受け取り、内容をテキストで返す（Google Docs→plain text, Sheets→CSV, Slides→plain text） |
 | `search_drive` | ファイル名キーワードで Drive を検索する。`query` を省略すると `folder_id` 内の全件を返す。`include_shared_drives=false` かつ `folder_id` 未指定でマイドライブ root を一覧表示 |

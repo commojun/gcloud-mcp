@@ -606,19 +606,19 @@ async def read_sheet(params: ReadSheetInput) -> str:
 
     rows = []
     for i, row in enumerate(values):
-        # Pad shorter rows with empty strings so every column is present
-        padded = row + [""] * (max_cols - len(row))
         cells = {
             col_index_to_letter(start_col_idx + j): str(v)
-            for j, v in enumerate(padded)
+            for j, v in enumerate(row)
+            if str(v) != ""
         }
-        rows.append({"row": start_row + i, "cells": cells})
+        if cells:
+            rows.append({"row": start_row + i, "cells": cells})
 
     result: dict = {
         "range": actual_range,
         "sheet": sheet_label,
         "row_count": len(rows),
-        "col_count": max_cols,
+        "col_count": max(len(r["cells"]) for r in rows) if rows else 0,
         "show_formulas": params.show_formulas,
         "rows": rows,
     }
