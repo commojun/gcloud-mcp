@@ -38,23 +38,25 @@ mcp = FastMCP("gcloud_workspace_mcp")
 # Token acquisition
 # ---------------------------------------------------------------------------
 
-async def get_access_token() -> tuple[Optional[str], Optional[str]]:
+async def get_access_token(account: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
     """Return (token, None) on success or (None, error_message) on failure."""
+    cmd = [GCLOUD_PATH, "auth", "print-access-token"]
+    if account:
+        cmd.append(f"--account={account}")
     try:
         process = await asyncio.create_subprocess_exec(
-            GCLOUD_PATH,
-            "auth",
-            "print-access-token",
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
             err = stderr.decode().strip()
+            account_hint = f" --account={account}" if account else ""
             return None, (
                 f"Error: gcloud auth failed: {err}\n\n"
                 "To authenticate, run:\n"
-                "  gcloud auth login --enable-gdrive-access"
+                f"  gcloud auth login{account_hint} --enable-gdrive-access"
             )
         return stdout.decode().strip(), None
     except FileNotFoundError:
@@ -230,6 +232,16 @@ async def api_write(
 # Input models
 # ---------------------------------------------------------------------------
 
+ACCOUNT_FIELD = Field(
+    default=None,
+    description=(
+        "Google account email to use (e.g. 'personal@gmail.com'). "
+        "If omitted, the default gcloud account is used. "
+        "The account must be authenticated via: gcloud auth login --enable-gdrive-access"
+    ),
+)
+
+
 class ReadSheetInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
@@ -267,6 +279,7 @@ class ReadSheetInput(BaseModel):
             "cell of a range before writing to spill cells."
         ),
     )
+    account: Optional[str] = ACCOUNT_FIELD
 
 
 class ListSheetsInput(BaseModel):
@@ -277,6 +290,7 @@ class ListSheetsInput(BaseModel):
         description="Google Sheets URL or bare spreadsheet ID",
         min_length=1,
     )
+    account: Optional[str] = ACCOUNT_FIELD
 
 
 class ReadDriveFileInput(BaseModel):
@@ -291,15 +305,19 @@ class ReadDriveFileInput(BaseModel):
         ),
         min_length=1,
     )
+    account: Optional[str] = ACCOUNT_FIELD
 
 
 class SearchDriveInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    query: str = Field(
-        ...,
-        description="Keyword to match against file names in Google Drive",
-        min_length=1,
+    query: Optional[str] = Field(
+        default=None,
+        description=(
+            "Keyword to match against file names in Google Drive. "
+            "If omitted or empty, all items in the specified folder are returned "
+            "(folder_id must be provided in that case)."
+        ),
         max_length=200,
     )
     folder_id: Optional[str] = Field(
@@ -316,6 +334,7 @@ class SearchDriveInput(BaseModel):
         ge=1,
         le=100,
     )
+    account: Optional[str] = ACCOUNT_FIELD
 
 
 class ValueInputOption(str, Enum):
@@ -362,6 +381,7 @@ class UpdateSheetInput(BaseModel):
             "RAW: values are stored exactly as provided, no interpretation."
         ),
     )
+    account: Optional[str] = ACCOUNT_FIELD
 
 
 class AppendRowsInput(BaseModel):
@@ -391,6 +411,7 @@ class AppendRowsInput(BaseModel):
             "RAW: values stored exactly as provided."
         ),
     )
+    account: Optional[str] = ACCOUNT_FIELD
 
 
 class ClearRangeInput(BaseModel):
@@ -416,10 +437,74 @@ class ClearRangeInput(BaseModel):
             "Sheet tab name. Prepended to range_a1 if range_a1 does not already contain '!'."
         ),
     )
+    account: Optional[str] = ACCOUNT_FIELD
 
 
 # ---------------------------------------------------------------------------
 # Tools
+
+
+@mcp.tool(
+    name="list_accounts",
+    annotations={
+        "title": "List authenticated gcloud accounts",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def list_accounts() -> str:
+    """List all Google accounts authenticated with gcloud.
+
+    Use this to discover available account emails before calling other tools
+    with the account parameter.
+
+    Returns:
+        str: JSON array of authenticated accounts.
+
+        Success schema:
+        [
+            {
+                "account": str,   # Email address
+                "active": bool    # True if this is the current default account
+            }
+        ]
+
+        Error example: "Error: gcloud auth failed: ..."
+    """
+    try:
+        process = await asyncio.create_subprocess_exec(
+            GCLOUD_PATH,
+            "auth",
+            "list",
+            "--format=json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            err = stderr.decode().strip()
+            return (
+                f"Error: gcloud auth failed: {err}\n\n"
+                "To authenticate, run:\n"
+                "  gcloud auth login --enable-gdrive-access"
+            )
+        raw = json.loads(stdout.decode())
+        accounts = [
+            {
+                "account": entry.get("account"),
+                "active": entry.get("status") == "ACTIVE",
+            }
+            for entry in raw
+        ]
+        return json.dumps(accounts, ensure_ascii=False, indent=2)
+    except FileNotFoundError:
+        return (
+            f"Error: gcloud CLI not found at '{GCLOUD_PATH}'.\n"
+            "Install from https://cloud.google.com/sdk/docs/install\n"
+            "Or set the GCLOUD_PATH environment variable to the full path."
+        )
 # ---------------------------------------------------------------------------
 
 @mcp.tool(
@@ -470,7 +555,7 @@ async def read_sheet(params: ReadSheetInput) -> str:
 
         Error example: "Error 403 Forbidden: ..."
     """
-    token, err = await get_access_token()
+    token, err = await get_access_token(params.account)
     if err:
         return err
 
@@ -587,7 +672,7 @@ async def list_sheets(params: ListSheetsInput) -> str:
 
         Error example: "Error 404 Not Found: ..."
     """
-    token, err = await get_access_token()
+    token, err = await get_access_token(params.account)
     if err:
         return err
 
@@ -660,7 +745,7 @@ async def read_drive_file(params: ReadDriveFileInput) -> str:
 
         Error example: "Error 403 Forbidden: ..."
     """
-    token, err = await get_access_token()
+    token, err = await get_access_token(params.account)
     if err:
         return err
 
@@ -727,9 +812,13 @@ async def search_drive(params: SearchDriveInput) -> str:
     Returns file IDs, names, MIME types, last-modified times, and web links.
     Results are sorted by most recently modified first.
 
+    If query is omitted or empty, all items in the specified folder are returned
+    (folder_id must be provided in that case).
+
     Args:
         params (SearchDriveInput):
-            - query (str): Keyword to match against file names
+            - query (Optional[str]): Keyword to match against file names.
+              If empty, all items in folder_id are returned.
             - folder_id (Optional[str]): Restrict to a specific folder
             - include_shared_drives (bool): Include Shared Drive files (default: True)
             - max_results (int): Max results to return (1–100, default: 20)
@@ -739,7 +828,8 @@ async def search_drive(params: SearchDriveInput) -> str:
 
         Success schema:
         {
-            "query": str,
+            "query": str,            # omitted if no query was given
+            "folder_id": str,        # omitted if no folder was specified
             "count": int,
             "files": [
                 {
@@ -755,17 +845,27 @@ async def search_drive(params: SearchDriveInput) -> str:
 
         Error example: "Error 403 Forbidden: ..."
     """
-    token, err = await get_access_token()
+    token, err = await get_access_token(params.account)
     if err:
         return err
 
-    # Sanitize the query to prevent injection via the Drive API q parameter
-    safe_query = params.query.replace("'", "\\'")
-    q_parts = [f"name contains '{safe_query}'", "trashed = false"]
+    has_query = bool(params.query and params.query.strip())
+    if not has_query and not params.folder_id:
+        if params.include_shared_drives:
+            return "Error: Either query or folder_id must be provided."
+        # include_shared_drives=False → default to My Drive root
+        effective_folder_id = "root"
+    else:
+        effective_folder_id = extract_drive_file_id(params.folder_id) if params.folder_id else None
 
-    if params.folder_id:
-        folder_id = extract_drive_file_id(params.folder_id)
-        q_parts.append(f"'{folder_id}' in parents")
+    q_parts = ["trashed = false"]
+
+    if has_query:
+        safe_query = params.query.replace("'", "\\'")
+        q_parts.append(f"name contains '{safe_query}'")
+
+    if effective_folder_id:
+        q_parts.append(f"'{effective_folder_id}' in parents")
 
     api_params: dict = {
         "q": " and ".join(q_parts),
@@ -783,13 +883,17 @@ async def search_drive(params: SearchDriveInput) -> str:
 
     files = resp.json().get("files", [])
     if not files:
-        return f"No files found matching '{params.query}'."
+        if has_query:
+            return f"No files found matching '{params.query}'."
+        return "No files found in the specified folder."
 
-    return json.dumps(
-        {"query": params.query, "count": len(files), "files": files},
-        ensure_ascii=False,
-        indent=2,
-    )
+    result: dict = {"count": len(files), "files": files}
+    if has_query:
+        result["query"] = params.query
+    if effective_folder_id:
+        result["folder_id"] = effective_folder_id
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +947,7 @@ async def update_sheet(params: UpdateSheetInput) -> str:
 
         Error example: "Error 400 Bad Request: ..."
     """
-    token, err = await get_access_token()
+    token, err = await get_access_token(params.account)
     if err:
         return err
 
@@ -910,7 +1014,7 @@ async def append_rows(params: AppendRowsInput) -> str:
 
         Error example: "Error 403 Forbidden: ..."
     """
-    token, err = await get_access_token()
+    token, err = await get_access_token(params.account)
     if err:
         return err
 
@@ -991,7 +1095,7 @@ async def clear_range(params: ClearRangeInput) -> str:
 
         Error example: "Error 403 Forbidden: ..."
     """
-    token, err = await get_access_token()
+    token, err = await get_access_token(params.account)
     if err:
         return err
 

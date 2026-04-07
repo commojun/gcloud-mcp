@@ -11,7 +11,8 @@ gcloud CLI の OAuth2 認証情報を使って Google Sheets / Drive API を呼�
 | `read_sheet` | Sheets の URL/ID を受け取り、セルアドレス付きの JSON 形式でデータを返す。`show_formulas=true` で数式文字列を取得可能 |
 | `list_sheets` | スプレッドシートのシート名一覧とプロパティ（行数・列数・非表示フラグ）を返す |
 | `read_drive_file` | Drive ファイルの URL/ID を受け取り、内容をテキストで返す（Google Docs→plain text, Sheets→CSV, Slides→plain text） |
-| `search_drive` | ファイル名キーワードで Drive を検索する。フォルダ絞り込み・Shared Drive 対応 |
+| `search_drive` | ファイル名キーワードで Drive を検索する。`query` を省略すると `folder_id` 内の全件を返す。`include_shared_drives=false` かつ `folder_id` 未指定でマイドライブ root を一覧表示 |
+| `list_accounts` | gcloud に認証済みの Google アカウント一覧を返す。`account` パラメータに何を指定すべきか判断するために使う |
 
 ### 書き込み
 
@@ -30,6 +31,15 @@ gcloud CLI の OAuth2 認証情報を使って Google Sheets / Drive API を呼�
 gcloud auth login --enable-gdrive-access
 ```
 
+複数アカウントを使いたい場合は、アカウントごとにログインする（既存の認証情報は消えない）：
+
+```bash
+gcloud auth login --enable-gdrive-access  # 2つ目のアカウントでログイン
+gcloud auth list                          # 登録済みアカウント確認
+```
+
+各ツールの `account` パラメータに使用するアカウントのメールアドレスを指定することで切り替えられる。省略時はデフォルトアカウント（`*` のついているもの）が使われる。
+
 ## インストール・MCP 登録
 
 ```bash
@@ -37,7 +47,7 @@ gcloud auth login --enable-gdrive-access
 git clone https://github.com/commojun/gcloud-workspace-mcp ~/git/gcloud-mcp
 
 # Claude Code に MCP サーバーとして登録
-claude mcp add gcloud-workspace --scope user \
+claude mcp add gcloud --scope user \
   -- uvx --from ~/git/gcloud-mcp gcloud-workspace-mcp
 ```
 
